@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
+"""
+Virtual battery monitor for Victron GX devices. Meant to be used instead of JK BMS' poor SOC estimator.
+
+Algorithm:
+  - Maintain our own SOC by integrating the BMS current (coulomb counting).
+  - Periodically save SOC to disk so it survives restarts.
+  - When the battery is at rest (low |power|) for long enough AND its voltage
+    is OUTSIDE the configured "dead zone" (the flat voltage plateau), realign
+    the SOC against the OCV curve.
+  - Inside the dead zone, voltage carries almost no SOC information, so only
+    coulomb counting is used.
+"""
+
 import sys
 import os
-import dbus
+import time
 import json
+import dbus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 
@@ -10,15 +24,35 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService, VeDbusItemImport
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-JK_SERVICE        = 'com.victronenergy.battery.socketcan_can0'
-REST_POWER_W      = 250   # seuil repos en watts
-REST_DURATION_S   = 300      # secondes au repos avant correction OCV
-OCV_MIN_DELTA_PCT = 0.5      # correction ignorée si écart < 0.5%
-OFFSET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'offset.json')
+JK_SERVICE          = 'com.victronenergy.battery.socketcan_can0'
 
+# Rest detection
+REST_POWER_W        = 250    # |P| below this => considered "at rest"
+REST_DURATION_S     = 300    # seconds at rest before OCV recalibration is allowed
 
-# OCV curve -> SOC  (linear interpolation between points)
-# (voltage_V, soc_%)  sorted by ascending voltage. Points can be added.
+# OCV recalibration
+OCV_MIN_DELTA_PCT   = 0.1    # ignore correction if |OCV_SOC - current_SOC| < this
+OCV_MAX_JUMP_PCT    = 100.0   # safety: refuse OCV jumps larger than this in one shot. Warning: 
+                              # if the current SOC estimator is way off, set this to 100 to allow 
+                              # jumping to a better value.
+
+# Dead zone: voltage range where OCV is NOT used to update SOC.
+# For a 16S LiFePO4 pack, the plateau is roughly between ~20% and ~90% SOC.
+OCV_DEAD_ZONE_V     = (51.2, 53.2)   # (low, high) inclusive
+
+# Coulomb counting
+CHARGE_EFFICIENCY   = 1.00   # 1.0 = ideal (LiFePO4); use 0.98–0.99 for Li-ion
+                             # applied only when current > 0 (charging)
+
+# Persistence
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'soc_state.json')
+SAVE_INTERVAL_S = 60         # seconds between periodic SOC saves to disk
+
+# Update loop
+UPDATE_PERIOD_MS = 1000
+
+# OCV curve  -> SOC  (linear interpolation between points)
+# (voltage_V, soc_%)  sorted by ascending voltage. Add points to refine.
 OCV_CURVE = [
     (44.0,   0.0),
     (46.0,   5.0),
@@ -34,6 +68,7 @@ OCV_CURVE = [
 
 
 def ocv_to_soc(voltage):
+    """Linear interpolation of the OCV curve."""
     if voltage <= OCV_CURVE[0][0]:
         return OCV_CURVE[0][1]
     if voltage >= OCV_CURVE[-1][0]:
@@ -43,48 +78,73 @@ def ocv_to_soc(voltage):
         v1, s1 = OCV_CURVE[i + 1]
         if v0 <= voltage <= v1:
             return s0 + (s1 - s0) * (voltage - v0) / (v1 - v0)
+    return OCV_CURVE[-1][1]  # fallback (unreachable)
 
 
-def load_offset():
+def in_dead_zone(voltage):
+    lo, hi = OCV_DEAD_ZONE_V
+    return lo <= voltage <= hi
+
+
+def load_state():
+    """Return (soc, age_seconds) or (None, None) if no/invalid state file."""
     try:
-        with open(OFFSET_FILE) as f:
-            offset = json.load(f)['offset']
-            print(f"Restored offset from disk: {offset:+.1f}%")
-            return offset
-    except:
-        print("No saved offset, starting with 0.0%")
-        return 0.0
-
-
-def save_offset(offset):
-    try:
-        with open(OFFSET_FILE, 'w') as f:
-            json.dump({'offset': offset}, f)
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        soc = float(data['soc'])
+        ts  = float(data.get('timestamp', 0))
+        age = max(0.0, time.time() - ts) if ts > 0 else None
+        if 0.0 <= soc <= 100.0:
+            print(f"Restored SOC from disk: {soc:.2f}%"
+                  + (f" (saved {age/60:.1f} min ago)" if age is not None else ""))
+            return soc, age
+    except FileNotFoundError:
+        print("No saved SOC state, will initialize from BMS.")
     except Exception as e:
-        print(f"Error saving offset: {e}")
+        print(f"Could not read SOC state: {e}")
+    return None, None
+
+
+def save_state(soc):
+    try:
+        tmp = STATE_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({'soc': soc, 'timestamp': time.time()}, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        print(f"Error saving SOC state: {e}")
+
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def main():
     DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
 
-    # ── Lecture JK BMS ────────────────────────────────────────────────────────
-    imp_voltage = VeDbusItemImport(bus, JK_SERVICE, '/Dc/0/Voltage')
-    imp_current = VeDbusItemImport(bus, JK_SERVICE, '/Dc/0/Current')
+    # ── BMS imports ───────────────────────────────────────────────────────────
+    imp_voltage  = VeDbusItemImport(bus, JK_SERVICE, '/Dc/0/Voltage')
+    imp_current  = VeDbusItemImport(bus, JK_SERVICE, '/Dc/0/Current')
     imp_soc_jk   = VeDbusItemImport(bus, JK_SERVICE, '/Soc')
-    imp_capacity = VeDbusItemImport(bus, JK_SERVICE, '/Capacity')
+    imp_capacity = VeDbusItemImport(bus, JK_SERVICE, '/InstalledCapacity')
+    imp_temp     = VeDbusItemImport(bus, JK_SERVICE, '/Dc/0/Temperature')
 
-
-    # ── Service virtuel ───────────────────────────────────────────────────────
+    # ── Virtual service ───────────────────────────────────────────────────────
     svc = VeDbusService('com.victronenergy.battery.virtual', bus=bus, register=False)
 
     svc.add_path('/Mgmt/ProcessName',    __file__)
-    svc.add_path('/Mgmt/ProcessVersion', '1.0')
+    svc.add_path('/Mgmt/ProcessVersion', '2.0')
     svc.add_path('/Mgmt/Connection',     'Virtual')
     svc.add_path('/DeviceInstance',      99)
     svc.add_path('/ProductId',           0)
     svc.add_path('/ProductName',         'BetterEstimatorGX')
-    svc.add_path('/FirmwareVersion',     1)
+    svc.add_path('/FirmwareVersion',     2)
     svc.add_path('/HardwareVersion',     1)
     svc.add_path('/Connected',           1)
 
@@ -101,62 +161,133 @@ def main():
     svc.add_path('/Alarms/HighVoltage',  0)
     svc.add_path('/Alarms/LowSoc',       0)
 
-    svc.add_path('/Info/Offset',         0.0)
     svc.add_path('/Info/RestTimer',      0)
+    svc.add_path('/Info/InDeadZone',     0)
+    svc.add_path('/Info/SocBmsDelta',    0.0)   # virtual_SOC - BMS_SOC, for monitoring
     svc.add_path('/Info/LastCorrection', 'none')
 
     svc.register()
-    print("Service 'Virtual Battery Manager' registered on bus")
+    print("Service 'com.victronenergy.battery.virtual' registered on bus")
 
-    # ── State ──────────────────────────────────────────────────────────────────
-    offset     = load_offset()
-    rest_timer = 0
+    # ── State ─────────────────────────────────────────────────────────────────
+    saved_soc, _ = load_state()
+    if saved_soc is None:
+        bms_soc = safe_float(imp_soc_jk.get_value(), 50.0)
+        soc = bms_soc
+        print(f"Initialized SOC from BMS: {soc:.2f}%")
+    else:
+        soc = saved_soc
 
-    # ── Udate loop ─────────────────────────────────────────────────────────────
+    state = {
+        'soc':            soc,
+        'rest_timer':     0.0,
+        'last_update':    time.monotonic(),
+        'last_save':      time.monotonic(),
+        'last_save_soc':  soc,
+    }
+
+    # ── Update loop ───────────────────────────────────────────────────────────
     def update():
-        nonlocal offset, rest_timer
+        now = time.monotonic()
+        dt  = now - state['last_update']
+        state['last_update'] = now
 
-        voltage = float(imp_voltage.get_value() or 0)
-        current = float(imp_current.get_value() or 0)
-        soc_jk  = float(imp_soc_jk.get_value()  or svc['/Soc'])
-        power   = voltage * current
+        # Sanity-clip dt (handles clock jumps, suspends, etc.)
+        if dt < 0 or dt > 10.0:
+            dt = UPDATE_PERIOD_MS / 1000.0
 
-        # Rest timer
+        voltage  = safe_float(imp_voltage.get_value())
+        current  = safe_float(imp_current.get_value())
+        bms_soc  = safe_float(imp_soc_jk.get_value(), state['soc'])
+        capacity = safe_float(imp_capacity.get_value())
+        temp     = imp_temp.get_value()
+        power    = voltage * current
+
+        # ── Coulomb counting ──────────────────────────────────────────────────
+        # Sign convention (Victron): current > 0 = charging, < 0 = discharging.
+        if capacity > 0:
+            eff = CHARGE_EFFICIENCY if current > 0 else 1.0
+            delta_ah  = current * eff * dt / 3600.0
+            delta_soc = delta_ah / capacity * 100.0
+            state['soc'] = max(0.0, min(100.0, state['soc'] + delta_soc))
+
+        # ── Rest detection ────────────────────────────────────────────────────
         if abs(power) < REST_POWER_W:
-            rest_timer += 1
+            state['rest_timer'] += dt
         else:
-            rest_timer = 0
+            state['rest_timer'] = 0.0
 
-        # Correct with OCV if the resting period was long enough
-        if rest_timer >= REST_DURATION_S:
-            corrected = ocv_to_soc(voltage)
-            if abs(corrected - (soc_jk + offset)) > OCV_MIN_DELTA_PCT:
-                old_offset = offset
-                offset = corrected - soc_jk
-                save_offset(offset)
-                print(f"Correction OCV: V={voltage:.2f}V  soc_jk={soc_jk:.1f}%  "
-                      f"offset {old_offset:+.1f}% -> {offset:+.1f}%  "
-                      f"soc_virtuel={corrected:.1f}%")
-                svc['/Info/LastCorrection'] = f"OCV@{voltage:.2f}V => {corrected:.1f}%"
-            rest_timer = 0
+        dead = in_dead_zone(voltage)
 
-        virtual_soc = soc_jk + offset
+        # ── OCV recalibration (only outside the dead zone) ────────────────────
+        if state['rest_timer'] >= REST_DURATION_S and not dead and voltage > 0:
+            ocv_soc = ocv_to_soc(voltage)
+            delta   = ocv_soc - state['soc']
+            if abs(delta) > OCV_MIN_DELTA_PCT:
+                if abs(delta) > OCV_MAX_JUMP_PCT:
+                    # Refuse implausibly large jumps (sensor glitch, bad curve, etc.)
+                    msg = (f"OCV jump rejected (>{OCV_MAX_JUMP_PCT:.0f}%): "
+                           f"V={voltage:.2f}V soc={state['soc']:.1f}% "
+                           f"ocv_soc={ocv_soc:.1f}%")
+                    print(msg)
+                    svc['/Info/LastCorrection'] = (
+                        f"REJECTED OCV@{voltage:.2f}V => {ocv_soc:.1f}%"
+                    )
+                else:
+                    old_soc = state['soc']
+                    state['soc'] = ocv_soc
+                    save_state(state['soc'])
+                    state['last_save']     = now
+                    state['last_save_soc'] = state['soc']
+                    print(f"OCV recalibration: V={voltage:.2f}V "
+                          f"soc {old_soc:.2f}% -> {ocv_soc:.2f}% "
+                          f"(Δ={delta:+.2f}%)")
+                    svc['/Info/LastCorrection'] = (
+                        f"OCV@{voltage:.2f}V => {ocv_soc:.1f}%"
+                    )
+            # Reset rest timer whether we corrected or not, to avoid spamming
+            state['rest_timer'] = 0.0
 
-        svc['/Soc']              = round(max(0.0, min(100.0, virtual_soc)), 1)
-        svc['/Dc/0/Voltage']     = round(voltage, 2)
-        svc['/Dc/0/Current']     = round(current, 2)
-        svc['/Dc/0/Power']       = round(power, 1)
-        svc['/Info/Offset']      = round(offset, 2)
-        svc['/Info/RestTimer']   = rest_timer
-        
-        capacity = imp_capacity.get_value()
+        # ── Periodic state save ───────────────────────────────────────────────
+        if (now - state['last_save']) >= SAVE_INTERVAL_S and \
+           abs(state['soc'] - state['last_save_soc']) > 0.05:
+            save_state(state['soc'])
+            state['last_save']     = now
+            state['last_save_soc'] = state['soc']
 
-        svc['/Capacity']          = capacity
-        svc['/InstalledCapacity'] = capacity
+        # ── Publish to D-Bus ──────────────────────────────────────────────────
+        soc_out = round(state['soc'], 1)
+        svc['/Soc']                = soc_out
+        svc['/Dc/0/Voltage']       = round(voltage, 2)
+        svc['/Dc/0/Current']       = round(current, 2)
+        svc['/Dc/0/Power']         = round(power, 1)
+        svc['/Dc/0/Temperature']   = temp
+        svc['/Capacity']           = (round(capacity * state['soc'] / 100.0, 2)
+                                      if capacity > 0 else None)
+        svc['/InstalledCapacity']  = capacity if capacity > 0 else None
+        svc['/ConsumedAmphours']   = (round(-capacity * (100.0 - state['soc']) / 100.0, 2)
+                                      if capacity > 0 else None)
 
-        return True  # keep the timer
+        svc['/Info/RestTimer']     = int(state['rest_timer'])
+        svc['/Info/InDeadZone']    = 1 if dead else 0
+        svc['/Info/SocBmsDelta']   = round(state['soc'] - bms_soc, 2)
 
-    GLib.timeout_add(1000, update)
+        return True  # keep timer running
+
+    # Save on graceful shutdown
+    def on_shutdown():
+        try:
+            save_state(state['soc'])
+            print(f"Final SOC saved: {state['soc']:.2f}%")
+        except Exception as e:
+            print(f"Shutdown save failed: {e}")
+
+    import atexit, signal
+    atexit.register(on_shutdown)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: sys.exit(0))
+
+    GLib.timeout_add(UPDATE_PERIOD_MS, update)
     GLib.MainLoop().run()
 
 

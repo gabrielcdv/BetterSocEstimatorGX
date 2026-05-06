@@ -19,6 +19,8 @@ import json
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
+import fcntl
+import errno
 
 sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService, VeDbusItemImport
@@ -66,6 +68,34 @@ OCV_CURVE = [
 ]
 # ──────────────────────────────────────────────────────────────────────────────
 
+LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'virtual_battery.lock')
+
+def acquire_single_instance_lock():
+    """Prevent more than one copy of this script from running at once."""
+    fp = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EAGAIN):
+            print("Another instance is already running. Exiting.")
+            sys.exit(0)
+        raise
+    fp.write(str(os.getpid()))
+    fp.flush()
+    return fp  # keep the file object alive for the lifetime of the process
+
+
+def register_with_retry(svc, attempts=10, delay=1.5):
+    """Retry svc.register() to ride out transient name-ownership conflicts."""
+    for i in range(1, attempts + 1):
+        try:
+            svc.register()
+            return
+        except dbus.exceptions.NameExistsException:
+            if i == attempts:
+                raise
+            print(f"D-Bus name busy (attempt {i}/{attempts}), retrying in {delay:.1f}s...")
+            time.sleep(delay)
 
 def ocv_to_soc(voltage):
     """Linear interpolation of the OCV curve."""
@@ -125,6 +155,8 @@ def safe_float(value, default=0.0):
 
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
     DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
 
@@ -166,7 +198,8 @@ def main():
     svc.add_path('/Info/SocBmsDelta',    0.0)   # virtual_SOC - BMS_SOC, for monitoring
     svc.add_path('/Info/LastCorrection', 'none')
 
-    svc.register()
+    _lock = acquire_single_instance_lock()
+    register_with_retry(svc)
     print("Service 'com.victronenergy.battery.virtual' registered on bus")
 
     # ── State ─────────────────────────────────────────────────────────────────

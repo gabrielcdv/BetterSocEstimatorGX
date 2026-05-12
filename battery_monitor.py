@@ -38,9 +38,7 @@ OCV_MAX_JUMP_PCT    = 100.0   # safety: refuse OCV jumps larger than this in one
                               # if the current SOC estimator is way off, set this to 100 to allow 
                               # jumping to a better value.
 
-# Dead zone: voltage range where OCV is NOT used to update SOC.
-# For a 16S LiFePO4 pack, the plateau is roughly between ~20% and ~90% SOC.
-OCV_DEAD_ZONE_V     = (51.2, 53.2)   # (low, high) inclusive
+
 
 # Coulomb counting
 CHARGE_EFFICIENCY   = 1.00   # 1.0 = ideal (LiFePO4); use 0.98–0.99 for Li-ion
@@ -56,16 +54,33 @@ UPDATE_PERIOD_MS = 1000
 # OCV curve  -> SOC  (linear interpolation between points)
 # (voltage_V, soc_%)  sorted by ascending voltage. Add points to refine.
 OCV_CURVE = [
-    (44.0,   0.0),
-    (46.0,   5.0),
-    (48.0,  15.0),
-    (50.0,  30.0),
-    (51.0,  50.0),
-    (52.0,  70.0),
-    (53.0,  85.0),
-    (54.0,  95.0),
-    (54.6, 100.0),
+    (44.80,   0.0),
+    (46.40,   2.0),
+    (48.00,   5.0),
+    (49.60,   8.0),
+    (50.40,  10.0),
+    (51.20,  13.0),
+    (51.52,  15.0),
+    (51.84,  20.0),
+    (52.00,  25.0),
+    (52.08,  30.0),
+    (52.16,  40.0),
+    (52.24,  50.0),
+    (52.32,  60.0),
+    (52.48,  70.0),
+    (52.64,  75.0),
+    (52.80,  80.0),
+    (53.12,  85.0),
+    (53.44,  88.0),
+    (53.76,  90.0),
+    (54.24,  93.0),
+    (54.56,  95.0),
+    (54.88,  98.0),
+    (55.20, 100.0),
 ]
+# Dead zone: voltage range where OCV is NOT used to update SOC.
+# For a 16S LiFePO4 pack, the plateau is roughly between ~20% and ~90% SOC.
+OCV_DEAD_ZONE_V     = (51.1, 53.9)   # (low, high) inclusive
 # ──────────────────────────────────────────────────────────────────────────────
 
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'virtual_battery.lock')

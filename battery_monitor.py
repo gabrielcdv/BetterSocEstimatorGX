@@ -47,7 +47,7 @@ CHARGE_EFFICIENCY   = 1.00   # 1.0 = ideal (LiFePO4); use 0.98–0.99 for Li-ion
 # SOH estimation
 INITIAL_SOH         = 1.00   # starting guess if no saved value
 SOH_MIN             = 0.50   # clamp: anything below is rejected as a bad measurement
-SOH_MAX             = 1.15   # clamp: anything above is rejected as a bad measurement
+SOH_MAX             = 1.30   # clamp: anything above is rejected as a bad measurement
 SOH_MIN_DELTA_SOC   = 25.0   # need at least this much OCV-measured SOC change
                              # between two anchors before we trust an SOH sample
 SOH_EMA_ALPHA       = 0.25   # smoothing factor for SOH updates (0..1).
